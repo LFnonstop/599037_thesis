@@ -3,7 +3,7 @@ This repository stores the code and results of my thesis.
 DataPrep_final:   
   (1) .rmd for data pre-processing   
   (2) final dataset  
-TopicModelling_final:   
+TopicModelling:   
   (1) .rmd for topic modelling;   
   (2) excel file: 40 topics, top-20 words of each topic, and my manual label on each topic  
 SupervisedModels:    
