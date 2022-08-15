@@ -2,7 +2,7 @@ This repository stores the code and results of my thesis.
 
 DataPrep_final:   
   (1) .rmd for data pre-processing   
-  (2) final dataset (financial features + topic features)
+  (2) final dataset (financial features + topic features)  
 TopicModelling:   
   (1) .rmd for topic modelling;   
   (2) excel file: 40 topics, top-20 words of each topic, and my manual labelling on each topic  
