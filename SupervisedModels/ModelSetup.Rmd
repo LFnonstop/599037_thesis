@@ -1,0 +1,45 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+rm(list=ls())
+```
+
+# Library
+
+```{r include=FALSE}
+library(tidyverse)
+library(tidymodels)
+```
+
+# Load data
+
+```{r}
+load("df_final.RData")
+```
+
+# 1. Create train-test split
+```{r}
+set.seed(59903)
+split <- initial_split(data = df_final, prop = 0.7, strata = "AAER")
+```
+
+```{r}
+dfTrain <- training(split)
+dfTest <- testing(split)
+```
+
+# 2. Set up 5-fold cross validation
+
+```{r}
+set.seed(59)
+cv_folds <- dfTrain %>% vfold_cv(v = 5, strata = "AAER")
+```
+
+# 3. Save the dataset
+
+```{r}
+save(dfTrain,split,dfTrain,dfTest,cv_folds,file = "ML_data.RData")
+```
