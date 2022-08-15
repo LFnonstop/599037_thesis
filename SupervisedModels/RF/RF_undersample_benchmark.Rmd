@@ -1,0 +1,161 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+rm(list=ls())
+```
+
+# Library
+
+```{r include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(ranger)
+library(themis)
+library(vip)
+library(doParallel)
+registerDoParallel()
+cluster <- makeCluster(detectCores(logical = TRUE)-4)
+registerDoParallel(cluster)
+```
+
+# Load data
+
+```{r}
+load("ML_Data.RData")
+```
+
+# 1. Set up recipe
+
+```{r}
+recipe_rf <- recipe(AAER ~ ., data = dfTrain) %>%
+  update_role(companyid, keydevid, transcriptid, headline, year, quarter, cik, new_role = "metadata") %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_downsample(AAER, under_ratio = 1, seed = 599) %>%
+  update_role(Topic_01, Topic_02, Topic_03, Topic_04, Topic_05, Topic_06, Topic_07, Topic_08, Topic_09, Topic_10, Topic_11, Topic_12, Topic_13, Topic_14, Topic_15, Topic_16, Topic_17, Topic_18, Topic_19, Topic_20, Topic_21, Topic_22, Topic_23, Topic_24, Topic_25, Topic_26, Topic_27, Topic_28, Topic_29, Topic_30, Topic_31, Topic_32, Topic_33, Topic_34, Topic_35, Topic_36, Topic_37, Topic_38, Topic_39, Topic_40, new_role = "dont_use")
+```
+
+# 2. Set up model
+
+```{r}
+rf <- rand_forest(mtry = tune(), trees=tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+```
+
+# 3. Combine into workflow
+
+```{r}
+rf_tune_wf <- workflow() %>% 
+  add_recipe(recipe_rf) %>% 
+  add_model(rf)
+rf_tune_wf
+```
+
+# 4. Set metrics
+
+```{r}
+class_metrics <- metric_set(accuracy, sensitivity, specificity, roc_auc)
+```
+
+# 5. Set parameters for tuning
+
+```{r}
+grid_rf <- expand.grid(mtry = 1:20, trees = c(100,200,500,1000,1500,2000))
+```
+
+# 6. Run tuning
+
+```{r}
+set.seed(59)
+rf_tune <- rf_tune_wf %>% 
+  tune_grid(resamples=cv_folds,
+            grid=grid_rf, 
+            metrics=class_metrics)
+```
+
+# 7. Plot tuning result
+
+```{r}
+rf_tune_metrics <- rf_tune %>% collect_metrics()
+rf_tune_metrics
+
+```
+
+```{r}
+rf_tune_metrics %>%
+  filter(.metric %in% c("roc_auc", "accuracy", "sensitivity","specificity")) %>%
+  filter(trees == 1000) %>%
+  ggplot(aes(x = mtry, y = mean, ymin = mean - std_err, ymax = mean + std_err, 
+             colour = .metric)) +
+  geom_line() +
+  geom_point() +
+  facet_grid(.metric ~ ., scales = "free_y") 
+```
+
+```{r}
+stopCluster(cluster)
+```
+
+# 8. Select best parameter
+
+```{r}
+rf_best <- rf_tune %>% 
+  select_best(metric = "roc_auc")
+rf_best
+```
+
+# 9. Finalized workflow
+
+```{r}
+rf_final_wf <- rf_tune_wf %>% finalize_workflow(rf_best)
+rf_final_wf
+```
+
+# 10. Performance on test set
+
+```{r}
+unregister_dopar <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list=ls(name=env), pos=env)
+}
+
+unregister_dopar()
+```
+
+```{r}
+set.seed(59)
+rf_final_fit <- rf_final_wf %>% 
+  last_fit(split, metrics = class_metrics)
+
+rf_final_fit %>% collect_metrics()
+```
+
+```{r}
+rf_final_fit %>% collect_predictions() %>% 
+  conf_mat(truth = AAER, estimate = .pred_class) 
+```
+
+# 11. Variable importance score
+
+```{r}
+rf_vi <- rand_forest(mtry=rf_best$mtry, trees=rf_best$trees) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "permutation")
+
+rf_vi_wf <- workflow() %>% 
+  add_model(rf_vi) %>% 
+  add_recipe(recipe_rf)
+
+set.seed(59)
+rf_vi_fit <- rf_vi_wf %>% 
+  fit(data = dfTrain)
+
+rf_vi_fit %>% extract_fit_parsnip() %>% vi()
+
+rf_vi_fit %>% extract_fit_parsnip() %>% vip(geom = "point", num_features = 10)
+
+```
