@@ -1,11 +1,17 @@
 This repository stores the code and results of my thesis.  
 
-DataPrep_final: .rmd for data pre-processing  
-TopicModelling_final: .rmd for topic modelling; excel file is 40 topics, top-20 words of each topic, and my manual label on each topic  
-SupervisedModels: .rmd & .html for modelling of three supervised algorithm—ridge logistic regression (Ridge), random forest (RF), k-nearest neighbours (KNN)   
+DataPrep_final: 
+  (1) .rmd for data pre-processing   
+  (2) final dataset  
+TopicModelling_final:   
+  (1) .rmd for topic modelling;   
+  (2) excel file: 40 topics, top-20 words of each topic, and my manual label on each topic  
+SupervisedModels:    
+  (1) ModelSetup.rmd: train-test split, create folds
+  (2) .rmd & .html: modelling of three supervised algorithms—ridge logistic regression (Ridge), random forest (RF), k-nearest neighbours (KNN)   
 
-Raw and large data files are stored at my OneDrive.  
+Raw and large data files are too large (70+G) so they cannot be stored here. I store them in my OneDrive.  
 
-Please let me know if you want to access the data, I will then share the link with you!  
+Please let me know if you want to access the raw data, I will then share the link with you!  
 
 Thank you very much!
