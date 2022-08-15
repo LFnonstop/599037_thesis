@@ -1,0 +1,209 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+rm(list=ls())
+```
+
+# Overview
+
+This notebook runs topic modelling.
+
+I run it on 32 core Microsoft Azure Databricks to speed up the slow computation process.
+
+# Library
+
+```{r include=FALSE}
+library(tidyverse)
+library(tidytext)
+library(topicmodels)
+library(tm)
+library(doParallel)
+library(writexl)
+```
+
+# 0. Data prep
+
+```{r}
+load("FullText_adj.RData")
+load("TranscriptDetails_Financial.RData")
+load("FullText_dtm.RData")
+```
+
+```{r}
+# On top of the FullText_adj dataframe, remove too-common and too-uncommon words
+
+# First, define a function for removing overly-common terms
+removeCommonTerms <- function (x, pct) 
+{
+    stopifnot(inherits(x, c("DocumentTermMatrix", "TermDocumentMatrix")), 
+        is.numeric(pct), pct > 0, pct < 1)
+    m <- if (inherits(x, "DocumentTermMatrix")) 
+        t(x)
+    else x
+    t <- table(m$i) < m$ncol * (pct)
+    termIndex <- as.numeric(names(t[t]))
+    if (inherits(x, "DocumentTermMatrix")) 
+        x[, termIndex]
+    else x[termIndex, ]
+}
+
+
+# Remove terms that exist in more than 80% of all documents; remove terms that exist only in less than 0.1% of all documents
+dtm_reduced <- removeCommonTerms(FullText_dtm, 0.8) %>% removeSparseTerms(sparse = 0.999)
+
+save(dtm_reduced, file = "dtm_reduced.RData")
+
+dtm_reduced
+```
+
+# 1. Try different number of topics
+
+```{r}
+load("dtm_reduced.RData")
+```
+
+To search for the optimal number of topics, I evaluate model using different k and look at their *perplexity*. Lower perplexity suggests better model fit.
+
+```{r}
+# set up a cluster for parallel processing
+cluster <- makeCluster(detectCores(logical = TRUE)/2)
+registerDoParallel(cluster)
+
+# load up the needed R package on all the parallel sessions
+clusterEvalQ(cluster, {
+  library(topicmodels)
+})
+
+full_data  <- dtm_reduced
+
+n <- nrow(full_data)
+set.seed(599037)
+splitter <- sample(1:n, round(n * 0.75))
+
+burnin = 250
+iter = 500
+
+candidate_k <- c(10, 15, 20, 25, 30, 40, 50, 60)
+
+# export all the needed R objects to the parallel sessions
+clusterExport(cluster, c("full_data", "burnin", "iter", "splitter" ,"candidate_k"))
+
+
+system.time({
+results <- foreach(k = candidate_k, .combine = rbind) %dopar%{
+   results_k <- matrix(0, nrow = 1, ncol = 2)
+   colnames(results_k) <- c("k", "perplexity")
+   train_set <- full_data[splitter, ]
+   valid_set <- full_data[-splitter, ]
+   fitted <- LDA(train_set, k = k, method = "Gibbs", control = list(seed = 599037, burnin = burnin, iter = iter))
+   results_k[1,] <- c(k, perplexity(fitted, newdata = valid_set))
+   return(results_k)
+}
+})
+stopCluster(cluster)
+
+results_df <- as.data.frame(results)
+
+ggplot(results_df, aes(x = k, y = perplexity)) +
+   geom_point() +
+   geom_smooth(se = FALSE) +
+   ggtitle("Performance of topic modelling") +
+   labs(x = "Candidate number of topics", y = "Perplexity when fitting the trained model to the test set")
+```
+
+```{r}
+save(results_df, file = "LDA_k_selection.RData")
+```
+
+
+To make my graph look more "complete", do once again k=2 & k=5 and combine them with previous result...
+```{r}
+# set up a cluster for parallel processing
+cluster <- makeCluster(detectCores(logical = TRUE)/2)
+registerDoParallel(cluster)
+
+# load up the needed R package on all the parallel sessions
+clusterEvalQ(cluster, {
+  library(topicmodels)
+})
+
+full_data  <- dtm_reduced
+
+n <- nrow(full_data)
+set.seed(599037)
+splitter <- sample(1:n, round(n * 0.75))
+
+burnin = 250
+iter = 500
+
+candidate_k <- c(2, 5)
+
+# export all the needed R objects to the parallel sessions
+clusterExport(cluster, c("full_data", "burnin", "iter", "splitter" ,"candidate_k"))
+
+
+system.time({
+results2 <- foreach(k = candidate_k, .combine = rbind) %dopar%{
+   results2_k <- matrix(0, nrow = 1, ncol = 2)
+   colnames(results2_k) <- c("k", "perplexity")
+   train_set <- full_data[splitter, ]
+   valid_set <- full_data[-splitter, ]
+   fitted <- LDA(train_set, k = k, method = "Gibbs", control = list(seed = 599037, burnin = burnin, iter = iter))
+   results2_k[1,] <- c(k, perplexity(fitted, newdata = valid_set))
+   return(results2_k)
+}
+})
+stopCluster(cluster)
+
+results_df <- as.data.frame(results2) %>% rbind(results_df) %>% arrange(k)
+
+ggplot(results_df, aes(x = k, y = perplexity)) +
+   geom_point() +
+   geom_smooth(se = FALSE) +
+   # ggtitle("Performance of topic modelling") +
+   labs(x = "Candidate number of topics", y = "Perplexity when fitting the trained model to the test set")
+```
+
+```{r}
+save(results_df, file = "LDA_k_selection.RData")
+```
+
+I select k=40 as perplexity reduces much slower when k>40 and it is a good tradeoff between better model performance and better model explainability (too large k does not make sense as human are not able to effectively distinguish them)
+
+Train the model on the entire dtm:
+```{r}
+LDA_40 <- LDA(dtm_reduced, k = 40, method = "Gibbs", control = list(seed = 599037, burnin = burnin, iter = iter))
+```
+
+Show words with top20 probability (beta) within each topic
+```{r}
+beta <- tidy(LDA_40, matrix = "beta")
+
+top_terms <- beta %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 20) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+```
+
+Extract each document's probability on each topic
+```{r}
+gamma <- tidy(LDA_40, matrix = "gamma")
+```
+
+```{r}
+top_terms_concat <- top_terms %>% group_by(topic) %>% mutate(all_terms = paste(term, collapse = ", ")) %>% select(topic, all_terms) %>% distinct(topic, .keep_all = T)
+```
+
+```{r}
+save(LDA_40, beta, gamma, top_terms, top_terms_concat, file = "LDA_40_result.RData")
+```
+
+```{r}
+write_xlsx(top_terms_concat, path = "LDA_topic_terms.xlsx")
+```
+
