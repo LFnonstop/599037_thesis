@@ -1,6 +1,6 @@
 This repository stores the code and results of my thesis.  
 
-DataPrep_final: 
+DataPrep_final:   
   (1) .rmd for data pre-processing   
   (2) final dataset  
 TopicModelling_final:   
