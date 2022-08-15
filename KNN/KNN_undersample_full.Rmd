@@ -1,0 +1,145 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+rm(list=ls())
+```
+
+# Library
+
+```{r include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(kknn)
+library(themis)
+library(vip)
+```
+
+# Load data
+
+```{r}
+load("ML_Data.RData")
+```
+
+# 1. Set up recipe
+
+```{r}
+recipe_knn <- recipe(AAER ~ ., data = dfTrain) %>%
+  update_role(companyid, keydevid, transcriptid, headline, year, quarter, cik, new_role = "metadata") %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_downsample(AAER, under_ratio = 1, seed = 599)
+```
+
+# 2. Set up model
+
+```{r}
+knn <- nearest_neighbor(neighbors = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kknn")
+```
+
+# 3. Combine into workflow
+
+```{r}
+knn_tune_wf <- workflow() %>% 
+  add_recipe(recipe_knn) %>% 
+  add_model(knn)
+knn_tune_wf
+```
+
+# 4. Set metrics
+
+```{r}
+class_metrics <- metric_set(accuracy, sensitivity, specificity, roc_auc)
+```
+
+# 5. Set parameters for tuning
+
+```{r
+grid_knn <- expand.grid(neighbors = c(1,3,5,7,9,11,13,15,17,19,21,23,25,27,29))
+```
+
+# 6. Run tuning
+
+```{r}
+set.seed(59)
+knn_tune <- knn_tune_wf %>% 
+  tune_grid(resamples=cv_folds,
+            grid=grid_knn, 
+            metrics=class_metrics)
+```
+
+# 7. Plot tuning result
+
+```{r}
+knn_tune_metrics <- knn_tune %>% collect_metrics()
+knn_tune_metrics
+
+```
+
+```{r}
+knn_tune_metrics %>%
+  filter(.metric %in% c("roc_auc", "accuracy", "sensitivity","specificity")) %>%
+  ggplot(aes(x = neighbors, y = mean, ymin = mean - std_err, ymax = mean + std_err, 
+             colour = .metric)) +
+  geom_line() +
+  geom_point() +
+  facet_grid(.metric ~ ., scales = "free_y") 
+```
+
+
+# 8. Select best parameter
+
+```{r}
+knn_best <- knn_tune %>% 
+  select_best(metric = "roc_auc")
+knn_best
+```
+
+# 9. Finalized workflow
+
+```{r}
+knn_final_wf <- knn_tune_wf %>% finalize_workflow(knn_best)
+knn_final_wf
+```
+
+# 10. Peknnormance on test set
+
+```{r}
+set.seed(59)
+knn_final_fit <- knn_final_wf %>% 
+  last_fit(split, metrics = class_metrics)
+
+knn_final_fit %>% collect_metrics()
+```
+
+```{r}
+knn_final_fit %>% collect_predictions() %>% 
+  conf_mat(truth = AAER, estimate = .pred_class) 
+```
+
+# 11. Variable importance score
+
+```{r}
+knn_vi <- nearest_neighbor(neighbors=knn_best$neighbors) %>%
+  set_mode("classification") %>%
+  set_engine("kknn", importance = "permutation")
+
+knn_vi_wf <- workflow() %>% 
+  add_model(knn_vi) %>% 
+  add_recipe(recipe_knn)
+
+set.seed(59)
+knn_vi_fit <- knn_vi_wf %>% 
+  fit(data = dfTrain)
+
+knn_vi_fit %>% extract_fit_parsnip() %>% vi()
+
+knn_vi_fit %>% extract_fit_parsnip() %>% vip(geom = "point", num_features = 10)
+
+```
+
+
