@@ -1,0 +1,864 @@
+---
+title: "Data Prep"
+output: html_notebook
+---
+
+```{r}
+rm(list=ls())
+```
+
+```{r}
+memory.limit(size = 49152)
+```
+
+# Overview
+
+This R Notebook is for data pre-processing. Three types of raw data (transcripts; AAER; financial fundamentals) are loaded, cleaned and merged to form the final dataset for running machine learning algorithms.
+
+# Library
+
+```{r include=FALSE}
+library(tidyverse)
+library(tidytext)
+library(vroom)
+library(tm)
+library(SnowballC)
+library(DescTools)
+library(readxl)
+```
+
+
+
+
+# 1. Pre-processing of transcripts data
+
+## 1.1. Clean transcript details
+
+Transcript details files stores metadata of each transcript (distinguishable through column *transcriptid*), such as company name/id, event id, event type, etc. Due to large amount, data are stored in 13 csv files, with a split every 200000 *transcriptid* (i.e., first file is for *transcriptid* 1-200000, second file is for *transcriptid* 200001-400000, so on).
+
+Event id (column *keydevid*) is an identifier for the event a transcript corresponds to, e.g., a specific earnings call. Each transcript is associated with an event id, but one event id could be associated with multiple transcripts—that's because the database stores multiple versions of the transcript of a specific event, e.g., proofed copy, edited copy, spellchecked copy, etc (denote by *transcriptcollectiontypename*). We only need one among all versions for every event, so we have to make event id distinct.
+
+Event type id (*keydeveventtypeid*) denotes the type of the event. As the raw data do not only contain earnings call, we will filter event type id == 48 (the numerical type for earnings call) to remove all other event types. 
+
+```{r}
+TranscriptDetails <-
+  list.files(path = "D:/Thesis_R/Data/CIQ-Transcripts/Transcript Details/", pattern = "*.csv", full.names = T) %>% 
+  map_df(~read_csv(., col_types = cols(.default = "c")))  %>%
+  filter(keydeveventtypeid == 48) %>%
+  distinct(keydevid, .keep_all = T) %>%
+  select(companyid, keydevid, transcriptid, headline)
+```
+
+Next, I extract the year and quarter information from *headline*, as the raw data does not have a dedicated column for the year and quarter to which a transcript is related. Regular expression will be used for the extraction.
+
+```{r}
+TranscriptDetails <- TranscriptDetails %>% 
+  mutate(year = str_extract(headline, "\\d{4}"), quarter = str_extract(headline, " (Q|H)\\d "), other = str_extract(headline, regex("\\w+ months", ignore_case = T))) %>% 
+  filter(is.na(year) == F)       #drop year == NA
+```
+
+```{r}
+# Mutate quarter: H1->Q2, H2->Q4, NA->Q4
+TranscriptDetails$quarter[TranscriptDetails$quarter == " H1 "] <- "Q2"
+TranscriptDetails$quarter[TranscriptDetails$quarter == " H2 "] <- "Q4"
+TranscriptDetails$quarter[is.na(TranscriptDetails$quarter) == T & is.na(TranscriptDetails$other) == T] <- "Q4"
+TranscriptDetails$quarter[TranscriptDetails$other == "Nine Months"] <- "Q3"
+
+TranscriptDetails <- TranscriptDetails %>% filter(is.na(quarter) == F) %>% select(-other)
+
+TranscriptDetails <- TranscriptDetails %>%
+  mutate(quarter = str_extract(quarter, "\\d"))
+
+TranscriptDetails$year = as.numeric(TranscriptDetails$year)
+TranscriptDetails$quarter = as.numeric(TranscriptDetails$quarter)
+TranscriptDetails$transcriptid = as.numeric(TranscriptDetails$transcriptid)
+
+# Although later we will find that AAER dataset includes observations before and including 2016, only transcripts before and including 2013 are kept, because there are too few AAER firm quarters after 2013——SEC investigates misstatements retrospectively, so the more recent a year is, the fewer AAERs there are. Including years with too few AAERs may skew the model, in the sense that some firms' misstatement may eventually be exposed in the future but now the algorithm has to see them as innocent firms, which could impair the effectiveness of the model.
+
+# Transcripts before 2008 are dropped because before 2008 there are too few transcripts available in the dataset compared to later years.
+TranscriptDetails <- TranscriptDetails %>%
+  filter(year >=2008 & year <= 2013)
+
+head(TranscriptDetails)
+
+```
+
+```{r}
+# Check companyid-year-quarter duplicate
+TranscriptDetails %>% group_by(companyid, year, quarter) %>% count() %>% arrange(desc(n))
+```
+```{r}
+TranscriptDetails <- TranscriptDetails %>% distinct(companyid, year, quarter, .keep_all = T)
+```
+
+The above steps generate a list of 89321 distinct earnings call transcripts for further processing.
+
+Year distribution of earnings call transcripts:
+
+```{r}
+TranscriptDetails %>% group_by(year, quarter) %>% count()
+TranscriptDetails$companyid <- as.integer(TranscriptDetails$companyid)
+```
+
+```{r}
+save(TranscriptDetails, file = "TranscriptDetails.RData")
+```
+
+```{r}
+load("TranscriptDetails.RData")
+```
+
+## 1.2. Pre-processing of transcripts text
+
+In this section I load the transcripts text data and transform them into tidy text format and document-term matrix (DTM). Like transcript details data, transcript texts are stored in 13 csv files, with a split every 200000 *transcriptid* (i.e., first file is for *transcriptid* 1-200000, second file is for *transcriptid* 200001-400000, so on). To save computational power, all transcripts that are not in the list generated in Section 1 will be dropped.
+
+Texts are stored in the form of "Transcript components". A transcript component is an uninterrupted piece of language from a person speaking during the event—a component starts when someone starts talking and ends when he/she passes the floor to others. Therefore, each transcript consists of multiple components, and each component is associated with one single person. Transcripts components are categorized into several types, denoted by *TranscriptComponentTypeId*. Component type ids represent the following types:
+
+1: Presentation Operator Message
+2: Presenter Speech
+3: Question
+4: Answer
+5: Presentation section
+6: Question and answer section
+7: Question and answer operator message
+8: Unknown Question and Answer Message
+
+I drop all components by operators (id == 1 or 7), because their languages are mostly greetings or choosing questioners, thus bearing little substantive information.
+
+### 1.2.1. Import transcript texts data
+
+```{r}
+text1 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/1.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text1 <- text1 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text1 <- text1 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text1 <- text1 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text1 <- text1 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- text1
+
+save(FullText, file = "FullText.RData")
+
+rm(text1)
+```
+
+```{r}
+text2 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/200001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text2 <- text2 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text2 <- text2 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text2 <- text2 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text2 <- text2 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text2)
+
+save(FullText, file = "FullText.RData")
+
+rm(text2)
+  
+```
+
+```{r}
+text3 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/400001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text3 <- text3 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text3 <- text3 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text3 <- text3 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text3 <- text3 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text3)
+
+save(FullText, file = "FullText.RData")
+
+rm(text3)
+  
+```
+
+```{r}
+text4 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/600001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text4 <- text4 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text4 <- text4 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text4 <- text4 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text4 <- text4 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text4)
+
+save(FullText, file = "FullText.RData")
+
+rm(text4)
+  
+```
+
+
+```{r}
+text5 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/800001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text5 <- text5 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text5 <- text5 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text5 <- text5 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text5 <- text5 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text5)
+
+save(FullText, file = "FullText.RData")
+
+rm(text5)
+  
+```
+
+```{r}
+text6 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/1000001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text6 <- text6 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text6 <- text6 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text6 <- text6 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text6 <- text6 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text6)
+
+save(FullText, file = "FullText.RData")
+
+rm(text6)
+  
+```
+
+```{r}
+text7 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/1200001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text7 <- text7 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text7 <- text7 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text7 <- text7 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text7 <- text7 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text7)
+
+save(FullText, file = "FullText.RData")
+
+rm(text7)
+  
+```
+
+```{r}
+text8 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/1400001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text8 <- text8 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text8 <- text8 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text8 <- text8 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text8 <- text8 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text8)
+
+save(FullText, file = "FullText.RData")
+
+rm(text8)
+  
+```
+
+```{r}
+text9 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/1600001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text9 <- text9 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text9 <- text9 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text9 <- text9 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text9 <- text9 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text9)
+
+save(FullText, file = "FullText.RData")
+
+rm(text9)
+  
+```
+
+
+```{r}
+text10 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/1800001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text10 <- text10 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text10 <- text10 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text10 <- text10 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text10 <- text10 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text10)
+
+save(FullText, file = "FullText.RData")
+
+rm(text10)
+  
+```
+
+```{r}
+text11 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/2000001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text11 <- text11 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text11 <- text11 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text11 <- text11 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text11 <- text11 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text11)
+
+save(FullText, file = "FullText.RData")
+
+rm(text11)
+  
+```
+
+```{r}
+text12 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/2200001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text12 <- text12 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text12 <- text12 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text12 <- text12 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text12 <- text12 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text12)
+
+save(FullText, file = "FullText.RData")
+
+rm(text12)
+  
+```
+
+```{r}
+text13 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/2400001.csv") %>%
+  select(transcriptid, transcriptcomponenttypeid, componenttext) %>%
+  semi_join(TranscriptDetails, by = "transcriptid") 
+
+text13 <- text13 %>%
+  filter(transcriptcomponenttypeid != 1 & transcriptcomponenttypeid != 7) %>%
+  select(-transcriptcomponenttypeid)
+
+text13 <- text13 %>%
+  mutate(componenttext = str_replace_all(componenttext, "\\.", "\\ "))
+
+text13 <- text13 %>%
+  unnest_tokens(word, componenttext) %>%
+  anti_join(stop_words) %>% # remove stop words
+  filter(!str_detect(word, "[0-9]")) %>% # remove numbers
+  mutate(word = wordStem(word)) # stem the tokens
+  
+text13 <- text13 %>%
+  count(transcriptid, word, sort = TRUE)
+
+FullText <- rbind(FullText, text13)
+
+save(FullText, file = "FullText.RData")
+
+rm(text13)
+  
+```
+
+Now all transcript texts have been transformed into document-term-count combinations, aggregated in *FullText* object.
+
+```{r}
+FullText %>% distinct(transcriptid) %>% count()
+```
+
+### 1.2.2. Inspect issues on data quality and make modifications
+
+```{r}
+load("FullText.RData")
+```
+
+<!-- ```{r} -->
+<!-- # Some transcripts have a lot of term "strong" in texts. This is a problem with the raw data. Below is an example: -->
+<!-- text101 <- vroom("D:/Thesis_R/Data/CIQ-Transcripts/Full Text/1.csv") %>% -->
+<!--   select(transcriptid, transcriptcomponenttypeid, componenttext) %>% -->
+<!--   semi_join(TranscriptDetails, by = "transcriptid") %>% -->
+<!--   filter(str_detect(componenttext, "strong")) %>% -->
+<!--   filter(transcriptid == 180) -->
+
+<!-- text101$componenttext -->
+<!-- ``` -->
+
+```{r}
+# We can see that such transcripts may not be properly parsed by the data vendor (Capital IQ)
+# To mitigate the problem, I drop all rows with term "strong"
+FullText_adj <- FullText %>% filter(word != "strong")
+```
+
+```{r}
+# Drop all rows with term "indiscernible" or "inaudible"
+FullText_adj <- FullText_adj %>% filter(!str_detect(word, "indiscern"))
+FullText_adj <- FullText_adj %>% filter(!str_detect(word, "inaudib"))
+```
+
+```{r}
+# Drop transcriptid == 16457, there is severe problem in original parsing
+FullText_adj <- FullText_adj %>% filter(transcriptid != 16457)
+```
+
+```{r}
+# Drop all rows with underscore
+FullText_adj <- FullText_adj %>% filter(!str_detect(word, "_"))
+```
+
+```{r}
+# Remove all apostrophes and rebuild the document-term-count table
+FullText_adj <- FullText_adj %>% mutate(word = str_remove_all(word, "\'"))
+FullText_adj <- FullText_adj %>% mutate(word = str_remove_all(word, "’"))
+
+FullText_adj <- FullText_adj %>% group_by(transcriptid, word) %>% summarize(n = sum(n)) %>% ungroup()
+```
+
+```{r}
+save(FullText_adj, file = "FullText_adj.RData")
+rm(FullText)
+```
+
+```{r}
+load("FullText_adj.RData")
+terms2 <- FullText_adj %>% distinct(word) %>% arrange(word)
+save(terms2, file = "terms2.RData")
+load("terms2.RData")
+```
+
+```{r}
+TranscriptDetails <- TranscriptDetails[TranscriptDetails$transcriptid %in% FullText_adj$transcriptid, ]
+save(TranscriptDetails, file = "TranscriptDetails.RData")
+```
+
+### 1.2.3. Convert tidy texts into DTM
+
+```{r}
+load("FullText_adj.RData")
+```
+
+```{r}
+FullText_dtm <- FullText_adj %>% cast_dtm(transcriptid, word, n)
+```
+
+```{r}
+save(FullText_dtm, file = "FullText_dtm.RData")
+rm(FullText_adj)
+```
+
+To make subsequent modelling realistic, I remove sparse terms using value 0.999, which means that only terms that exist in more than 0.1% of all documents are kept.
+
+```{r}
+load("FullText_dtm.RData")
+DTM_less_sparse <- removeSparseTerms(FullText_dtm, sparse = 0.999)
+save(DTM_less_sparse, file = "DTM_less_sparse.RData")
+terms_less_sparse <- Terms(DTM_less_sparse) %>% as.data.frame()
+```
+
+
+
+
+# 2. Pre-processing of financial fundamentals data
+
+## 2.1. Import the raw data and check for missing identifiers and duplicates
+
+```{r}
+Compustat_Raw <- read.csv("D:/Thesis_R/Data/Financial Fundamentals/Compustat_Raw.csv", encoding = "UTF-8")
+```
+
+```{r}
+# Drop all rows without CIK
+Compustat <- Compustat_Raw %>% filter(is.na(cik)==F)
+
+# Drop all rows with year-quarter missing
+Compustat <- Compustat %>% filter(is.na(fyearq)==F & is.na(fqtr)==F )
+
+# Check duplicate
+Compustat %>% group_by(cik, fyearq, fqtr) %>% count() %>% arrange(desc(n))
+
+# Drop duplicate
+Compustat <- Compustat %>% distinct(cik, fyearq, fqtr, .keep_all = T) %>% arrange(cik, fyearq, fqtr)
+
+```
+
+```{r}
+# Check NAs
+colSums(is.na(Compustat))
+```
+
+There are too many NAs for *ivstq* (Short-term investments) before 2008, which will bring some trouble on our ratio calculation. As Larcker & Zakolyukina (2012) suggested, for missing *ivstq*, we could use year-end value as substitute:
+
+```{r}
+# Load ivst annual data and drop rows with missing CIK and fyear, and remove duplicate cik-fyear combination
+ivst_annual <- read.csv("D:/Thesis_R/Data/Financial Fundamentals/IVST_annual.csv", encoding = "UTF-8") %>% select(cik, fyear, ivst) %>% filter(is.na(cik)==F) %>% filter(is.na(fyear)==F) %>% distinct(cik, fyear, .keep_all =  T) %>% arrange(cik, fyear)
+
+# In original quarterly dataframe, replace missing *ivst* with annual figure
+
+Compustat <- Compustat %>% left_join(ivst_annual, by = c("cik" = "cik", "fyearq" = "fyear")) %>% mutate(ivstq = ifelse(is.na(ivstq), ivst, ivstq)) %>% select(-ivst)
+
+
+
+
+```
+
+Reference: Larcker, D. F., & Zakolyukina, A. A. (2012). Detecting Deceptive Discussions in Conference Calls. Journal of Accounting Research, 50(2), 495–540. https://doi.org/10.1111/j.1475-679X.2012.00450.x
+
+## 2.2. Calculate financial ratios
+
+```{r}
+# Working capital accruals
+Compustat_calc <- Compustat %>% group_by(cik) %>% mutate(WC_acc = (((actq - lag(actq, n=4)) - (cheq - lag(cheq, n=4))) - ((lctq - lag(lctq, n=4)) - (dlcq - lag(dlcq, n=4))))/((atq + lag(atq, n=4))/2))
+
+# RSST accruals
+Compustat_calc <- Compustat_calc %>% group_by(cik) %>% mutate(RSST_acc = (((atq - ltq - pstkq) - (cheq - ivstq)) - ((lag(atq, n=4) - lag(ltq, n=4) - lag(pstkq, n=4)) - (lag(cheq, n=4) - lag(ivstq, n=4)))) / ((atq + lag(atq, n=4))/2))
+
+# Change in receivables
+Compustat_calc <- Compustat_calc %>% group_by(cik) %>% mutate(ch_rec = (rectq - lag(rectq, n=4)) / ((atq + lag(atq, n=4))/2))
+
+# Change in inventory
+Compustat_calc <- Compustat_calc %>% group_by(cik) %>% mutate(ch_inv = (invtq - lag(invtq, n=4)) / ((atq + lag(atq, n=4))/2))
+
+# Soft assets
+Compustat_calc <- Compustat_calc %>% group_by(cik) %>% mutate(soft_assets = (atq - ppentq - cheq)/atq)
+  
+# Change in cash sales
+Compustat_calc <- Compustat_calc %>% group_by(cik) %>% mutate(ch_cs = ((saleq - (rectq - lag(rectq, n=4))) - (lag(saleq, n=4) - (lag(rectq, n=4) - lag(rectq, n=8))))/(lag(saleq, n=4) - (lag(rectq, n=4) - lag(rectq, n=8))))
+
+# Change in cash margin
+Compustat_calc <- Compustat_calc %>% group_by(cik) %>% mutate(ch_cm = (1-(cogsq - (invtq - lag(invtq, n=4)) + (apq - lag(apq, n=4)))/(saleq - (rectq - lag(rectq, n=4)))) - (1-(lag(cogsq, n=4) - (lag(invtq, n=4) - lag(invtq, n=8)) + (lag(apq, n=4) - lag(apq, n=8)))/(lag(saleq, n=4) - (lag(rectq, n=4) - lag(rectq, n=8)))))
+
+# Change in ROA
+Compustat_calc <- Compustat_calc %>% group_by(cik) %>% mutate(ch_roa = ibq/((atq + lag(atq, n=4))/2) - lag(ibq, n=4)/((lag(ibq, n=4) + lag(atq, n=8))/2))
+  
+# Change in FCF
+Compustat_calc <- Compustat_calc %>% group_by(cik) %>% mutate(ch_fcf = ((ibq - (((atq - ltq - pstkq) - (cheq - ivstq)) - ((lag(atq, n=4) - lag(ltq, n=4) - lag(pstkq, n=4)) - (lag(cheq, n=4) - lag(ivstq, n=4))))) - (lag(ibq, n=4) - (((lag(atq, n=4) - lag(ltq, n=4) - lag(pstkq, n=4)) - (lag(cheq, n=4) - lag(ivstq, n=4))) - ((lag(atq, n=8) - lag(ltq, n=8) - lag(pstkq, n=8)) - (lag(cheq, n=8) - lag(ivstq, n=8))))))/((atq + lag(atq, n=4))/2))
+
+# book-to-market ratio
+Compustat_calc <- Compustat_calc %>% group_by(cik) %>% mutate(btm = ceqq / mkvaltq)
+
+# Actual issuance
+Compustat_calc$issue <- 0
+Compustat_calc$issue[Compustat_calc$dltisy > 0 | Compustat_calc$sstky > 0] <- 1
+
+```
+
+```{r}
+# Check lag: data could have gaps, construct column *ydiff* and *qdiff* to check——assign NA if ydiff !=1 and qdiff !=0
+
+Compustat_calc <- Compustat_calc %>% group_by(cik) %>%
+  mutate(ydiff = fyearq - lag(fyearq, n=4), qdiff = fqtr - lag(fqtr, n=4)) %>% ungroup()
+
+Compustat_calc$WC_acc[Compustat_calc$ydiff !=1 & Compustat_calc$qdiff !=0 ] <- NA
+Compustat_calc$RSST_acc[Compustat_calc$ydiff !=1 & Compustat_calc$qdiff !=0 ] <- NA
+Compustat_calc$ch_rec[Compustat_calc$ydiff !=1 & Compustat_calc$qdiff !=0 ] <- NA
+Compustat_calc$ch_inv[Compustat_calc$ydiff !=1 & Compustat_calc$qdiff !=0 ] <- NA
+Compustat_calc$soft_assets[Compustat_calc$ydiff !=1 & Compustat_calc$qdiff !=0 ] <- NA
+Compustat_calc$ch_cs[Compustat_calc$ydiff !=1 & Compustat_calc$qdiff !=0 ] <- NA
+Compustat_calc$ch_cm[Compustat_calc$ydiff !=1 & Compustat_calc$qdiff !=0 ] <- NA
+Compustat_calc$ch_roa[Compustat_calc$ydiff !=1 & Compustat_calc$qdiff !=0 ] <- NA
+Compustat_calc$ch_fcf[Compustat_calc$ydiff !=1 & Compustat_calc$qdiff !=0 ] <- NA
+Compustat_calc$btm[Compustat_calc$ydiff !=1 & Compustat_calc$qdiff !=0 ] <- NA
+Compustat_calc$issue[Compustat_calc$ydiff !=1 & Compustat_calc$qdiff !=0 ] <- NA
+
+Compustat_final <- Compustat_calc %>% select(cik, fyearq, fqtr, WC_acc, RSST_acc, ch_rec, ch_inv, soft_assets, ch_cs, ch_cm, ch_roa, ch_fcf, btm, issue)
+```
+
+```{r}
+# Check for NAs
+colSums(is.na(Compustat_final))
+```
+
+```{r}
+# Remove NAs
+Financial <- na.omit(Compustat_final)
+```
+
+```{r}
+# Remove year out of 2008-2013 sample period
+Financial <- Financial %>% filter(fyearq >= 2008 & fyearq <= 2013)
+```
+
+```{r}
+# Look at year-quarter distribution
+Financial %>% group_by(fyearq, fqtr) %>% count()
+```
+
+```{r}
+# Winsorize
+Financial$WC_acc <-Winsorize(Financial$WC_acc, probs = c(0.01, 0.99), na.rm=T)
+Financial$RSST_acc <-Winsorize(Financial$RSST_acc, probs = c(0.01, 0.99), na.rm=T)
+Financial$ch_rec <-Winsorize(Financial$ch_rec, probs = c(0.01, 0.99), na.rm=T)
+Financial$ch_inv <-Winsorize(Financial$ch_inv, probs = c(0.01, 0.99), na.rm=T)
+Financial$soft_assets <-Winsorize(Financial$soft_assets, probs = c(0.01, 0.99), na.rm=T)
+Financial$ch_cs <-Winsorize(Financial$ch_cs, probs = c(0.01, 0.99), na.rm=T)
+Financial$ch_cm <-Winsorize(Financial$ch_cm, probs = c(0.01, 0.99), na.rm=T)
+Financial$ch_roa <-Winsorize(Financial$ch_roa, probs = c(0.01, 0.99), na.rm=T)
+Financial$ch_fcf <-Winsorize(Financial$ch_fcf, probs = c(0.01, 0.99), na.rm=T)
+Financial$btm <-Winsorize(Financial$btm, probs = c(0.01, 0.99), na.rm=T)
+```
+
+```{r}
+Financial <- Financial %>% rename(year = fyearq, quarter = fqtr)
+```
+
+```{r}
+save(Financial, file = "Financial.RData")
+summary(Financial)
+```
+
+
+
+
+# 3. Map transcripts data with financial ratio data
+
+```{r}
+load("FullText_adj.RData")
+load("TranscriptDetails.RData")
+```
+
+```{r}
+load("Financial.RData")
+```
+
+```{r}
+CIKmapping <- read.csv("D:/Thesis_R/Data/CIQ-Transcripts/identifiers/CompanyId to CIK.csv", encoding = "UTF-8") %>% mutate(startdate = as.integer(startdate), enddate = as.integer(enddate)) %>% mutate(startdate = ifelse(is.na(startdate), 0, startdate), enddate = ifelse(is.na(enddate),99999999,enddate))
+
+# Remove start year >2015 and end year <2008
+
+CIKmapping <- CIKmapping %>% filter(!(startdate > 20140000 | enddate < 20080000)) %>% select(companyid, cik) %>% distinct(companyid, cik) %>% distinct(cik, .keep_all = T)
+
+```
+
+```{r}
+# First, map companyid onto Financials dataframe
+Financial <- Financial %>% left_join(CIKmapping, by = c("cik")) 
+```
+
+```{r}
+# Then, merge TranscriptDetails with Financials, generating a combined dataframe
+TranscriptDetails_Financial <- TranscriptDetails %>% inner_join(Financial, by = c("companyid", "year", "quarter"))
+```
+
+```{r}
+TranscriptDetails_Financial %>% group_by(companyid, transcriptid, year, quarter) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+TranscriptDetails_Financial <- TranscriptDetails_Financial %>% filter(companyid != 107534)
+```
+
+```{r}
+TranscriptDetails_Financial %>% group_by(companyid, year, quarter) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+save(TranscriptDetails_Financial, file = "TranscriptDetails_Financial.RData")
+```
+
+
+Here we have 51628 company-year-quarter observations in TranscriptDetails-Financial merged dataframe.
+The next step is to merge it with transcript texts data so that transcripts that are not within this 51648 transcripts are dropped.
+
+```{r}
+FullText_final <- FullText_adj[FullText_adj$transcriptid %in% TranscriptDetails_Financial$transcriptid, ]
+```
+
+```{r}
+save(FullText_final, file = "FullText_final.RData")
+```
+
+
+# 4. Generate document-term matrix (DTM)
+
+```{r}
+load("FullText_final.RData")
+```
+
+```{r}
+FullText_dtm <- FullText_final %>% cast_dtm(transcriptid, word, n)
+```
+
+```{r}
+save(FullText_dtm, file = "FullText_dtm.RData")
+rm(FullText_final)
+```
+
+# 5. Merge TranscriptDetails_Financial dataframe with AAER sample
+
+```{r}
+load("TranscriptDetails_Financial.RData")
+
+AAER <- read_xlsx(path = "D:/Thesis_R/Data/AAER/AAER_qtr.xlsx") %>% filter(is.na(CIK)==F & is.na(YEARA)==F & is.na(QTR)==F) %>% rename(year = YEARA, quarter = QTR, cik = CIK) %>% filter(year >= 2008 & year <= 2013) %>% select(cik, year, quarter) %>% mutate(AAER = 1)
+# 940 AAER CIK-quarter observations between 2008 and 2013
+
+df_final <- TranscriptDetails_Financial %>% left_join(AAER, by = c("cik", "year", "quarter"))
+
+df_final$AAER[is.na(df_final$AAER)==T] <- 0
+
+df_final %>% filter(AAER == 1) %>% count()
+# 272 in 51628 observations are fraudulent (0.5%)
+
+save(df_final, file = "df_final.RData")
+```
+
+# 6. (After topic probabilities are extracted from LDA result) merge df_final with topic probabilities
+
+```{r}
+load("LDA_40_result.RData")
+
+topic_prob <- gamma %>% mutate(topic = paste("Topic", formatC(topic, width=2, flag="0"),sep="_"), document = as.numeric(document)) %>% spread(topic, gamma, fill = NA)
+
+df_final <- df_final %>% left_join(topic_prob, by = c("transcriptid" = "document"))
+
+df_final$AAER <- factor(df_final$AAER, levels = c(1,0))
+df_final$issue <- factor(df_final$issue, levels = c(1,0))
+
+summary(df_final)
+
+save(df_final, file = "df_final.RData")
+```
+
